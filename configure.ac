@@ -207,6 +207,16 @@ UNI_PLUGIN_ENABLED(recorder)
 
 AM_CONDITIONAL([RECORDER_PLUGIN],[test "${enable_recorder_plugin}" = "yes"])
 
+dnl Sippulse recognizer plugin.
+UNI_PLUGIN_ENABLED(sippulserecog)
+
+AM_CONDITIONAL([SIPPULSERECOG_PLUGIN],[test "${enable_sippulserecog_plugin}" = "yes"])
+
+dnl Sippulse recognizer plugin.
+UNI_PLUGIN_ENABLED(sippulsesynth)
+
+AM_CONDITIONAL([SIPPULSESYNTH_PLUGIN],[test "${enable_sippulsesynth_plugin}" = "yes"])
+
 dnl Enable test suites.
 AC_ARG_ENABLE(test-suites,
     [AC_HELP_STRING([--enable-test-suites  ],[build test suites])],
@@ -237,6 +247,8 @@ AC_CONFIG_FILES([
     plugins/demo-synth/Makefile
     plugins/demo-recog/Makefile
     plugins/demo-verifier/Makefile
+    plugins/sippulse-recog/Makefile
+    plugins/sippulse-synth/Makefile
     platforms/Makefile
     platforms/libunimrcp-server/Makefile
     platforms/libunimrcp-client/Makefile
@@ -294,6 +306,8 @@ echo Demo synthesizer plugin....... : $enable_demosynth_plugin
 echo Demo recognizer plugin........ : $enable_demorecog_plugin
 echo Demo verifier plugin.......... : $enable_demoverifier_plugin
 echo Recorder plugin............... : $enable_recorder_plugin
+echo SipPulse recognizer plugin.... : $enable_sippulserecog_plugin
+echo SipPulse synthesizer plugin.... : $enable_sippulsesynth_plugin
 echo
 echo Installation layout........... : $layout_name
 echo Installation directory........ : $prefix

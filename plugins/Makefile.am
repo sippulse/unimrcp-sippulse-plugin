@@ -17,3 +17,11 @@ endif
 if RECORDER_PLUGIN
 SUBDIRS               += mrcp-recorder
 endif
+
+if SIPPULSERECOG_PLUGIN
+SUBDIRS               += sippulse-recog
+endif
+
+if SIPPULSESYNTH_PLUGIN
+SUBDIRS               += sippulse-synth
+endif

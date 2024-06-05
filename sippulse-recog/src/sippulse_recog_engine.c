@@ -46,10 +46,12 @@ typedef struct sippulse_recog_engine_t sippulse_recog_engine_t;
 typedef struct sippulse_recog_channel_t sippulse_recog_channel_t;
 typedef struct sippulse_recog_msg_t sippulse_recog_msg_t;
 
-/* TODO Key deve ser removida daqui */
-#define SIPPULSE_API_KEY "sp-79547443be70409eb5d179d0406fe198"
-//#define SIPPULSE_API_KEY "sp-30526e3392b7490490ae1c57cbd297cc"
+/** GET the API from the enviroment variable SIPPULSE_API_KEY */
+const char* get_api_key() {
+    return getenv("SIPPULSE_API_KEY");
+}
 
+#define SIPPULSE_API_KEY get_api_key()
 
 struct MemoryStruct {
   char *memory;

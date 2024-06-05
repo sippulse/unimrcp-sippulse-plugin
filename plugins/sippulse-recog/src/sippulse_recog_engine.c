@@ -38,6 +38,8 @@
 #include <stdint.h>
 #include <string.h>
 #include <samplerate.h>
+#include <unistd.h>
+#include <sys/types.h>
 
 #define RECOG_ENGINE_TASK_NAME "SipPulse Recog Engine"
 
@@ -47,7 +49,7 @@ typedef struct sippulse_recog_channel_t sippulse_recog_channel_t;
 typedef struct sippulse_recog_msg_t sippulse_recog_msg_t;
 
 /* TODO Key deve ser removida daqui */
-#define SIPPULSE_API_KEY "sp-79547443be70409eb5d179d0406fe198"
+#define SIPPULSE_API_KEY "sp-3d7f9c21c12f42c0a398a940b740f675"
 //#define SIPPULSE_API_KEY "sp-30526e3392b7490490ae1c57cbd297cc"
 
 
@@ -188,6 +190,28 @@ MRCP_PLUGIN_DECLARE(mrcp_engine_t*) mrcp_plugin_create(apr_pool_t *pool)
 				pool);                     /* pool to allocate memory from */
 }
 
+// Função para criar a resposta NLSML
+char* createNLSMLResponse(const char *result) {
+    // Estimate the size needed for the NLSML string, adjusting as necessary
+    size_t baseSize = strlen(result) + strlen(result) + 512; // Buffer size to account for fixed parts and dynamic content
+
+    char* nlsml = (char*)malloc(baseSize * sizeof(char));
+    if (nlsml == NULL) {
+        fprintf(stderr, "Memory allocation failed\n");
+        return NULL;
+    }
+
+    snprintf(nlsml, baseSize, "<?xml version=\"1.0\"?>\n"
+                              "<result>\n"
+                              "	<interpretation grammar=\"builtin:speech/transcribe\" confidence=\"1.00\">\n"
+                              "		<instance>%s</instance>\n"
+                              "		<input mode=\"speech\">%s</input>\n"
+                              "	</interpretation>\n"
+                              "</result>\n", result, result);
+
+    return nlsml;
+}
+
 /* CURL Write Call Back Function */
 size_t my_curl_write_callback(void *contents, size_t size, size_t nmemb, void *userp)
 {
@@ -252,12 +276,6 @@ int sippulse_recognizer_accept_waveform(sippulse_recog_channel_t *recog_channel)
         return 1;
     }
 
-	//Save in disk the content of the frame_buffer
-	FILE *fp;
-	fp = fopen("/home/unimrcp/audio.pcm", "wb");
-	fwrite(frame_buffer, 1, frame_size, fp);
-	fclose(fp);
-
 	// Initialize the chunk memory
 	chunk.memory = malloc(1);
 	chunk.size = 0;
@@ -310,6 +328,7 @@ int sippulse_recognizer_accept_waveform(sippulse_recog_channel_t *recog_channel)
 			curl_global_cleanup();
 			free(frame_buffer);
 			free(chunk.memory);
+			//fclose(recog_channel->audio_out);
 			return 1; // Indicate error
 		}
 
@@ -335,8 +354,10 @@ int sippulse_recognizer_accept_waveform(sippulse_recog_channel_t *recog_channel)
             curl_global_cleanup();
 			free(frame_buffer);
 			free(chunk.memory);
+			//fclose(recog_channel->audio_out);
 			return 1; // Indicate error
 		}
+
         // Cleanup
         curl_easy_cleanup(curl);
         curl_formfree(formpost);
@@ -344,6 +365,10 @@ int sippulse_recognizer_accept_waveform(sippulse_recog_channel_t *recog_channel)
         curl_global_cleanup();
 		free(frame_buffer);
 		free(chunk.memory);
+		if (ftruncate(fileno(recog_channel->audio_out), 0) != 0) {
+				apt_log(RECOG_LOG_MARK,APT_PRIO_WARNING,"Failed to truncate file");
+		}
+		//fclose(recog_channel->audio_out);
 		apt_log(RECOG_LOG_MARK,APT_PRIO_WARNING,"Everything clean");
 
     } else {
@@ -593,7 +618,9 @@ static apt_bool_t sippulse_recog_start_of_input(sippulse_recog_channel_t *recog_
 /* Raise sippulse RECOGNITION-COMPLETE event */
 static apt_bool_t sippulse_recog_recognition_complete(sippulse_recog_channel_t *recog_channel, mrcp_recog_completion_cause_e cause)
 {
+	
 	mrcp_recog_header_t *recog_header;
+
 	/* create RECOGNITION-COMPLETE event */
 	mrcp_message_t *message = mrcp_event_create(
 						recog_channel->recog_request,
@@ -615,28 +642,28 @@ static apt_bool_t sippulse_recog_recognition_complete(sippulse_recog_channel_t *
 	message->start_line.request_state = MRCP_REQUEST_STATE_COMPLETE;
 
 	if(cause == RECOGNIZER_COMPLETION_CAUSE_SUCCESS) {
-		{
 			/* load recognition result */
 			const char *result = recog_channel->http_response->response_body;
-		
-			apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Before Assign " APT_SIDRES_FMT,
-					MRCP_MESSAGE_SIDRES(recog_channel->recog_request));
+			char* nlsmlResult = createNLSMLResponse(result);
 
-
-			apt_string_assign_n(&message->body,result,strlen(result),message->pool);
-		}
-		
-
-		{
+    		if (nlsmlResult != NULL) {
+        		apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"NLSML Response created: %s", nlsmlResult);
+				apt_string_assign_n(&message->body,nlsmlResult,strlen(nlsmlResult),message->pool);
+				free(nlsmlResult); // Remember to free the allocated memory
+    		} else {
+				free(nlsmlResult); // Remember to free the allocated memory
+				apt_log(RECOG_LOG_MARK,APT_PRIO_WARNING,"Failed to create NLSML Response");
+				return FALSE;
+			}
+				
 			/* get/allocate generic header */
 			mrcp_generic_header_t *generic_header = mrcp_generic_header_prepare(message);
 			if(generic_header) {
 				/* set content types */
+				apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Setting Content Type to x-nlsml");
 				apt_string_assign(&generic_header->content_type,"application/x-nlsml",message->pool);
 				mrcp_generic_header_property_add(message,GENERIC_HEADER_CONTENT_TYPE);
 			}
-		}
-
 	}
 
 	apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Before Recog Channel " APT_SIDRES_FMT,
@@ -744,9 +771,10 @@ static apt_bool_t sippulse_recog_msg_process(apt_task_t *task, apt_task_msg_t *m
 		{
 			/* close channel, make sure there is no activity and send asynch response */
 			sippulse_recog_channel_t *recog_channel = (sippulse_recog_channel_t*)sippulse_msg->channel->method_obj;
-			apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Close Channel and file " APT_SIDRES_FMT,
-					MRCP_MESSAGE_SIDRES(recog_channel->recog_request));
-			if(recog_channel->audio_out) {
+
+			if(NULL == recog_channel->audio_out) {
+				apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"File already closed ");
+			} else {
 				fclose(recog_channel->audio_out); 
 				recog_channel->audio_out = NULL;
 			}
