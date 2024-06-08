@@ -107,6 +107,8 @@ struct sippulse_synth_channel_t {
 	apr_size_t             time_to_complete;
 	/** Is paused */
 	apt_bool_t             paused;
+	//Model
+	char 			  	  *model;
 	//File URL
 	char 			  	  *file_url;
 	/** Speech source (used instead of actual synthesis) */
@@ -234,14 +236,14 @@ static size_t write_response(void *contents, size_t size, size_t nmemb, http_res
 }
 
 
-void *perform_request(const char *voice, const char *text, sippulse_synth_channel_t *synth_channel) {
+void *perform_request(const char *voice, const char *text, const char* model, sippulse_synth_channel_t *synth_channel) {
     CURL *curl;
     CURLcode res;
     http_response response = {.data = NULL, .size = 0};
 
     curl = curl_easy_init();
     if(curl) {
-        curl_easy_setopt(curl, CURLOPT_URL, "https://api.sippulse.ai/v1/tts/azure");
+        curl_easy_setopt(curl, CURLOPT_URL, "https://api.sippulse.ai/v1/tts/generate");
         curl_easy_setopt(curl, CURLOPT_POST, 1L);
         
         // Setup HTTP headers
@@ -253,14 +255,29 @@ void *perform_request(const char *voice, const char *text, sippulse_synth_channe
         
 		curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
+		if (model == NULL) {
+			model = "azure-tts";
+		}
+
+		if (voice == NULL) {
+			apt_log(SYNTH_LOG_MARK,APT_PRIO_WARNING,"Voice is mandatory!!!");
+			return NULL;
+		}
+
+		if (text == NULL) {
+			apt_log(SYNTH_LOG_MARK,APT_PRIO_WARNING,"Text is mandatory!!!");
+			return NULL;
+		}
+
         // JSON data
-        const char *json_data_template = "{\"text\": \"%s\", \"voice\": \"%s\", \"output_format\": 16}";
+        const char *json_data_template = "{\"text\": \"%s\", \"voice\": \"%s\", \"output_format\": 16, \"model\": \"%s\"}";
 		char json_data_final[8192];
-		snprintf(json_data_final, sizeof(json_data_final), json_data_template, text, voice);
+		snprintf(json_data_final, sizeof(json_data_final), json_data_template, text, voice, model);
 		
 		apt_log(SYNTH_LOG_MARK,APT_PRIO_INFO,"JSON Data Template: %s", json_data_template);
 		apt_log(SYNTH_LOG_MARK,APT_PRIO_INFO,"Voice: %s", voice);
 		apt_log(SYNTH_LOG_MARK,APT_PRIO_INFO,"Text: %s", text);
+		apt_log(SYNTH_LOG_MARK,APT_PRIO_INFO,"Model: %s", model);
 		
 		apt_log(SYNTH_LOG_MARK,APT_PRIO_INFO,"JSON Data Final: %s", json_data_final);
 
@@ -427,6 +444,9 @@ static apt_bool_t sippulse_synth_channel_request_process(mrcp_engine_channel_t *
 static apt_bool_t sippulse_synth_channel_speak(mrcp_engine_channel_t *channel, mrcp_message_t *request, mrcp_message_t *response)
 {
 	const char *file_path = NULL;
+	const char *model = NULL;
+	int variant=0;
+
 	sippulse_synth_channel_t *synth_channel = channel->method_obj;
 	const mpf_codec_descriptor_t *descriptor = mrcp_engine_source_stream_codec_get(channel);
 
@@ -440,6 +460,23 @@ static apt_bool_t sippulse_synth_channel_speak(mrcp_engine_channel_t *channel, m
 	mrcp_synth_header_t *req_synth_header = mrcp_resource_header_get(request);
 	const char *voice = req_synth_header->voice_param.name.buf;
 
+	// Extract model from the request in the Voice-Variant format
+	//variant is an apr_size_t, so we can't use the buf field
+	variant = req_synth_header->voice_param.variant;
+	if (variant == 0) {
+		model = "azure-tts";
+	} else if (variant == 1) {
+		model = "google-tts";
+	} else if (variant == 2) {
+		model = "ibm-tts";
+	} else if (variant == 3) {
+		model = "aws-tts";
+	} else {
+		apt_log(SYNTH_LOG_MARK,APT_PRIO_WARNING,"Invalid Variant " APT_SIDRES_FMT, MRCP_MESSAGE_SIDRES(request));
+		response->start_line.status_code = MRCP_STATUS_CODE_METHOD_FAILED;
+		return FALSE;
+	}
+	
 	//get the text from the MRCP v2 synth request
 	const char *text = request->body.buf;
 
@@ -453,7 +490,7 @@ static apt_bool_t sippulse_synth_channel_speak(mrcp_engine_channel_t *channel, m
 	}
 
 	// Perform the HTTP request to the sippulse API
-	perform_request(voice, text, synth_channel);
+	perform_request(voice, text, model, synth_channel);
 
 	// Check if the file URL is valid
 	if(synth_channel->file_url == NULL) {

@@ -48,10 +48,12 @@ typedef struct sippulse_recog_engine_t sippulse_recog_engine_t;
 typedef struct sippulse_recog_channel_t sippulse_recog_channel_t;
 typedef struct sippulse_recog_msg_t sippulse_recog_msg_t;
 
-/* TODO Key deve ser removida daqui */
-#define SIPPULSE_API_KEY "sp-3d7f9c21c12f42c0a398a940b740f675"
-//#define SIPPULSE_API_KEY "sp-30526e3392b7490490ae1c57cbd297cc"
+/** GET the API from the enviroment variable SIPPULSE_API_KEY */
+const char* get_api_key() {
+    return getenv("SIPPULSE_API_KEY");
+}
 
+#define SIPPULSE_API_KEY get_api_key()
 
 struct MemoryStruct {
   char *memory;
@@ -131,6 +133,12 @@ struct sippulse_recog_channel_t {
 	FILE                    *audio_out;
 	/** File to write wav resampled */
 	http_response_t 		*http_response;
+	//** Prompt to pass to the API */
+	char                    *prompt;
+	//** Language to pass to the API */
+	char                    *language;
+	//** Model to pass to the API */
+	char                    *model;
 };
 
 typedef enum {
@@ -284,9 +292,22 @@ int sippulse_recognizer_accept_waveform(sippulse_recog_channel_t *recog_channel)
 	curl_global_init(CURL_GLOBAL_ALL);
 	curl = curl_easy_init();
 	if (curl) {
-		// Set the target URL
-		curl_easy_setopt(curl, CURLOPT_URL, "https://api.sippulse.ai/v1/asr/whisper?lang=en&response_format=text");
+		char url[8192];
+		
+		//Set defaults
+		if(recog_channel->model=="" || recog_channel->model==NULL) {
+			recog_channel->model="whisper-1";
+		}
 
+		if(recog_channel->prompt=="") {
+			snprintf(url, sizeof(url), "https://api.sippulse.ai/v1/asr/transcribe?lang=%s&response_format=text&model=%s", recog_channel->language, recog_channel->model);
+		} else {
+			snprintf(url, sizeof(url), "https://api.sippulse.ai/v1/asr/transcribe?lang=%s&response_format=text&model=%s&prompt=%s", recog_channel->language, recog_channel->model, recog_channel->prompt);
+		}
+
+		apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"URL: %s", url);
+		curl_easy_setopt(curl, CURLOPT_URL, url);
+	
 		// Prepare headers
 		headers = curl_slist_append(headers, "accept: application/json");
 		char auth_header[256];
@@ -521,6 +542,51 @@ static apt_bool_t sippulse_recog_channel_recognize(mrcp_engine_channel_t *channe
 		}
 	}
 
+	apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Process Request Line: %s",request->body.buf);
+	// Parse the line to extract the language and prompt
+	char* language = NULL;
+	char* prompt = NULL;
+	char* prompt_encoded = NULL;
+	char* model = NULL;
+	char* line = request->body.buf;
+	apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Line: %s",line);
+	char* token = strtok(line, "&");
+	while (token != NULL) {
+		if (strstr(token, "language=") != NULL) {
+			language = strchr(token, '=') + 1;
+		} else if (strstr(token, "prompt=") != NULL) {
+			prompt = strchr(token, '=') + 1;
+			//convert prompt to url encode of the prompt
+			prompt_encoded = curl_easy_escape(NULL, prompt, 0);
+		} else if (strstr(token, "model=") != NULL) {
+			model = strchr(token, '=') + 1;
+		}
+		token = strtok(NULL, "&");
+	}
+
+	// Store the language and prompt in the channel, if language not available, NULL
+	if (language == NULL) {
+		// Handle the error
+		apt_log(RECOG_LOG_MARK,APT_PRIO_WARNING,"Failed to extract language");
+		language = "";
+	}
+	recog_channel->language = strdup(language);
+	apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Language: %s",recog_channel->language);
+	
+	if (prompt_encoded == NULL) {
+		// Handle the error
+		apt_log(RECOG_LOG_MARK,APT_PRIO_WARNING,"Failed to encode prompt");
+		prompt_encoded="";
+	}
+	recog_channel->prompt = strdup(prompt_encoded);
+	apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Prompt: %s",recog_channel->prompt);
+
+	if (model == NULL) {
+		// Handle the error
+		apt_log(RECOG_LOG_MARK,APT_PRIO_WARNING,"Failed to extract model");
+		model = "";
+	}
+
 	response->start_line.request_state = MRCP_REQUEST_STATE_INPROGRESS;
 	/* send asynchronous response */
 	mrcp_engine_channel_message_send(channel,response);
@@ -699,8 +765,8 @@ static apt_bool_t sippulse_recog_stream_write(mpf_audio_stream_t *stream, const 
 					MRCP_MESSAGE_SIDRES(recog_channel->recog_request));
 				
 				if(!sippulse_recognizer_accept_waveform(recog_channel)) {
-					apt_log(RECOG_LOG_MARK,APT_PRIO_WARNING,"Failed to Accept Waveform " APT_SIDRES_FMT,
-					MRCP_MESSAGE_SIDRES(recog_channel->recog_request));
+					//apt_log(RECOG_LOG_MARK,APT_PRIO_WARNING,"Failed to Accept Waveform " APT_SIDRES_FMT,
+					MRCP_MESSAGE_SIDRES(recog_channel->recog_request);
 				}
 				sippulse_recog_recognition_complete(recog_channel, RECOGNIZER_COMPLETION_CAUSE_SUCCESS);
 				break;
