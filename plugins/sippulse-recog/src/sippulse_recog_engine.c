@@ -272,7 +272,7 @@ int sippulse_recognizer_accept_waveform(sippulse_recog_channel_t *recog_channel)
     if (frame_buffer == NULL) {
         perror("Memory error");
 		free(frame_buffer);
-        return 1;
+        return -1;
     }
 
 	// Read the file into the buffer
@@ -281,7 +281,7 @@ int sippulse_recognizer_accept_waveform(sippulse_recog_channel_t *recog_channel)
 	if (bytesRead != frame_size) {
         perror("Reading error");
         free(frame_buffer);
-        return 1;
+        return -1;
     }
 
 	// Initialize the chunk memory
@@ -350,7 +350,7 @@ int sippulse_recognizer_accept_waveform(sippulse_recog_channel_t *recog_channel)
 			free(frame_buffer);
 			free(chunk.memory);
 			//fclose(recog_channel->audio_out);
-			return 1; // Indicate error
+			return -1; // Indicate error
 		}
 
         // Check HTTP response code
@@ -376,7 +376,7 @@ int sippulse_recognizer_accept_waveform(sippulse_recog_channel_t *recog_channel)
 			free(frame_buffer);
 			free(chunk.memory);
 			//fclose(recog_channel->audio_out);
-			return 1; // Indicate error
+			return -1; // Indicate error
 		}
 
         // Cleanup
@@ -394,9 +394,9 @@ int sippulse_recognizer_accept_waveform(sippulse_recog_channel_t *recog_channel)
 
     } else {
         fprintf(stderr, "Could not initialize curl.\n");
-        return 1; // Indicate error
+        return -1; // Indicate error
     }
-    return 0; // Success
+    return 1; // Success
 }
 
 /** Destroy recognizer engine */
@@ -765,10 +765,11 @@ static apt_bool_t sippulse_recog_stream_write(mpf_audio_stream_t *stream, const 
 					MRCP_MESSAGE_SIDRES(recog_channel->recog_request));
 				
 				if(!sippulse_recognizer_accept_waveform(recog_channel)) {
-					//apt_log(RECOG_LOG_MARK,APT_PRIO_WARNING,"Failed to Accept Waveform " APT_SIDRES_FMT,
-					MRCP_MESSAGE_SIDRES(recog_channel->recog_request);
+					apt_log(RECOG_LOG_MARK,APT_PRIO_WARNING,"Failed to Accept Waveform " APT_SIDRES_FMT,
+					MRCP_MESSAGE_SIDRES(recog_channel->recog_request));
+				} else {
+					sippulse_recog_recognition_complete(recog_channel, RECOGNIZER_COMPLETION_CAUSE_SUCCESS);
 				}
-				sippulse_recog_recognition_complete(recog_channel, RECOGNIZER_COMPLETION_CAUSE_SUCCESS);
 				break;
 			case MPF_DETECTOR_EVENT_NOINPUT:
 				apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Detected Noinput " APT_SIDRES_FMT,
