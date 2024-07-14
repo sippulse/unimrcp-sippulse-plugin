@@ -134,11 +134,11 @@ struct sippulse_recog_channel_t {
 	/** File to write wav resampled */
 	http_response_t 		*http_response;
 	//** Prompt to pass to the API */
-	char                    *prompt;
+	char  		            *prompt;
 	//** Language to pass to the API */
-	char                    *language;
+	apt_str_t               *language;
 	//** Model to pass to the API */
-	char                    *model;
+	apt_str_t               *model;
 };
 
 typedef enum {
@@ -197,6 +197,23 @@ MRCP_PLUGIN_DECLARE(mrcp_engine_t*) mrcp_plugin_create(apr_pool_t *pool)
 				&engine_vtable,            /* virtual methods table of engine */
 				pool);                     /* pool to allocate memory from */
 }
+
+// Function to find the value of the parameter com.sippulse.prompt
+const char* get_prompt_value(const apt_pair_arr_t *param_pairs, apr_pool_t *pool) {
+    if (!param_pairs) {
+        return NULL;
+    }
+
+    for (int i = 0; i < param_pairs->nelts; i++) {
+        apt_pair_t *pair = &APR_ARRAY_IDX(param_pairs, i, apt_pair_t);
+        if (pair && pair->name.buf && strcasecmp(pair->name.buf, "com.sippulse.prompt") == 0) {
+            apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Prompt for whisper: %s", pair->value.buf);
+			return pair->value.buf;
+        }
+    }
+    return NULL;
+}
+
 
 // Função para criar a resposta NLSML
 char* createNLSMLResponse(const char *result) {
@@ -272,7 +289,7 @@ int sippulse_recognizer_accept_waveform(sippulse_recog_channel_t *recog_channel)
     if (frame_buffer == NULL) {
         perror("Memory error");
 		free(frame_buffer);
-        return -1;
+        return 0;
     }
 
 	// Read the file into the buffer
@@ -281,7 +298,7 @@ int sippulse_recognizer_accept_waveform(sippulse_recog_channel_t *recog_channel)
 	if (bytesRead != frame_size) {
         perror("Reading error");
         free(frame_buffer);
-        return -1;
+        return 0;
     }
 
 	// Initialize the chunk memory
@@ -294,15 +311,18 @@ int sippulse_recognizer_accept_waveform(sippulse_recog_channel_t *recog_channel)
 	if (curl) {
 		char url[8192];
 		
-		//Set defaults
-		if(recog_channel->model=="" || recog_channel->model==NULL) {
-			recog_channel->model="whisper-1";
-		}
+		apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Language for whisper: %s", recog_channel->language->buf);
+		
 
-		if(recog_channel->prompt=="") {
-			snprintf(url, sizeof(url), "https://api.sippulse.ai/v1/asr/transcribe?lang=%s&response_format=text&model=%s", recog_channel->language, recog_channel->model);
+		//Set defaults
+		//if(recog_channel->model->buf=="" || recog_channel->model->buf==NULL) {
+		//	recog_channel->model->buf="whisper-1";
+		//}
+
+		if(recog_channel->prompt=="" || recog_channel->prompt==NULL) {
+			snprintf(url, sizeof(url), "https://api.sippulse.ai/v1/asr/transcribe?language=%s&response_format=text&model=%s", recog_channel->language->buf, recog_channel->model->buf);
 		} else {
-			snprintf(url, sizeof(url), "https://api.sippulse.ai/v1/asr/transcribe?lang=%s&response_format=text&model=%s&prompt=%s", recog_channel->language, recog_channel->model, recog_channel->prompt);
+			snprintf(url, sizeof(url), "https://api.sippulse.ai/v1/asr/transcribe?language=%s&response_format=text&model=%s&prompt=%s", recog_channel->language->buf, recog_channel->model->buf,recog_channel->prompt);
 		}
 
 		apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"URL: %s", url);
@@ -350,23 +370,35 @@ int sippulse_recognizer_accept_waveform(sippulse_recog_channel_t *recog_channel)
 			free(frame_buffer);
 			free(chunk.memory);
 			//fclose(recog_channel->audio_out);
-			return -1; // Indicate error
+			return 0; // Indicate error
 		}
 
         // Check HTTP response code
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
 		if (http_code == 200) {
 			apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Server returned HTTP %ld", http_code);
-			apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Response: %s\n", chunk.memory);
-			apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Response size: %d\n", chunk.size);
+			apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Response: %s|", chunk.memory);
+			apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Response size: %d|", chunk.size);
 			// Success, now prepare to trigger recognition complete event
     		// This is where you'd typically analyze the response to set the appropriate cause
 			recog_channel->http_response = malloc(sizeof(http_response_t));
 			recog_channel->http_response->http_code = http_code;
-			recog_channel->http_response->response_body = malloc(chunk.size);
-			memcpy(recog_channel->http_response->response_body, chunk.memory, chunk.size);
-			recog_channel->http_response->response_size = chunk.size;
-			apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Response: saved %s", recog_channel->http_response->response_body);
+			recog_channel->http_response->response_body = (char *)malloc(chunk.size);
+    		if (recog_channel->http_response->response_body == NULL) {
+        		// Handle malloc failure
+        		free(recog_channel->http_response);
+        		return 0;
+    		}
+
+			// Copy the response body
+    		memcpy(recog_channel->http_response->response_body, chunk.memory, chunk.size);
+
+   			// Null-terminate the response body, replace the \n with \0
+    		recog_channel->http_response->response_body[chunk.size-1] = '\0';
+
+    		// Set the correct response size (excluding the null terminator for the size)
+    		recog_channel->http_response->response_size = chunk.size;
+			apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Response: saved %s|", recog_channel->http_response->response_body);
         } else {
 			apt_log(RECOG_LOG_MARK,APT_PRIO_WARNING,"Server returned HTTP %ld\n", http_code);
             curl_easy_cleanup(curl);
@@ -376,7 +408,7 @@ int sippulse_recognizer_accept_waveform(sippulse_recog_channel_t *recog_channel)
 			free(frame_buffer);
 			free(chunk.memory);
 			//fclose(recog_channel->audio_out);
-			return -1; // Indicate error
+			return 0; // Indicate error
 		}
 
         // Cleanup
@@ -394,7 +426,7 @@ int sippulse_recognizer_accept_waveform(sippulse_recog_channel_t *recog_channel)
 
     } else {
         fprintf(stderr, "Could not initialize curl.\n");
-        return -1; // Indicate error
+        return 0; // Indicate error
     }
     return 1; // Success
 }
@@ -500,6 +532,11 @@ static apt_bool_t sippulse_recog_channel_recognize(mrcp_engine_channel_t *channe
 {
 	/* process RECOGNIZE request */
 	mrcp_recog_header_t *recog_header;
+	mrcp_generic_header_t *generic_header;
+	apt_str_t *params_pair;
+	apt_pair_arr_t *pair_array;
+	apr_pool_t *pool;
+	mrcp_vendor_specific_params_list_t *vendor_specific_params_list;
 	sippulse_recog_channel_t *recog_channel = (sippulse_recog_channel_t*)channel->method_obj;
 	const mpf_codec_descriptor_t *descriptor = mrcp_engine_sink_stream_codec_get(channel);
 	
@@ -523,6 +560,32 @@ static apt_bool_t sippulse_recog_channel_recognize(mrcp_engine_channel_t *channe
 		if(mrcp_resource_header_property_check(request,RECOGNIZER_HEADER_SPEECH_COMPLETE_TIMEOUT) == TRUE) {
 			mpf_activity_detector_silence_timeout_set(recog_channel->detector,recog_header->speech_complete_timeout);
 		}
+
+		//Get the other recog headers
+		if(mrcp_resource_header_property_check(request,RECOGNIZER_HEADER_SPEECH_LANGUAGE) == TRUE) {
+			recog_channel->language = &recog_header->speech_language;
+		}
+
+		//Get the other recog headers
+		if(mrcp_resource_header_property_check(request,RECOGNIZER_HEADER_RECOGNITION_MODE) == TRUE) {
+			recog_channel->model = &recog_header->recognition_mode;
+		}
+
+		//Get the other recog headers
+		if(mrcp_generic_header_property_check(request,GENERIC_HEADER_VENDOR_SPECIFIC_PARAMS) == TRUE) {
+			mrcp_generic_header_t *generic_header = mrcp_generic_header_get(request);
+			recog_channel->prompt=NULL;
+			pair_array = generic_header->vendor_specific_params;
+			for (int i = 0; i < pair_array->nelts; i++) {
+        		apt_pair_t *pair = &APR_ARRAY_IDX(pair_array, i, apt_pair_t);
+        		if (pair && pair->name.buf && strcasecmp(pair->name.buf, "com.sippulse.prompt") == 0) {
+            		recog_channel->prompt=pair->value.buf;
+				}
+			}
+			//recog_channel->prompt=prompt_value;
+			//const char *prompt_value=get_prompt_value(pair_array,pool);
+			//apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Prompt for whisper: %s", recog_channel->prompt->buf);
+		}
 	}
 
 	if(!recog_channel->audio_out) {
@@ -540,51 +603,6 @@ static apt_bool_t sippulse_recog_channel_recognize(mrcp_engine_channel_t *channe
 		} else {
 			apt_log(RECOG_LOG_MARK,APT_PRIO_WARNING,"Failed to Generate Utterance Output File Path");	
 		}
-	}
-
-	apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Process Request Line: %s",request->body.buf);
-	// Parse the line to extract the language and prompt
-	char* language = NULL;
-	char* prompt = NULL;
-	char* prompt_encoded = NULL;
-	char* model = NULL;
-	char* line = request->body.buf;
-	apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Line: %s",line);
-	char* token = strtok(line, "&");
-	while (token != NULL) {
-		if (strstr(token, "language=") != NULL) {
-			language = strchr(token, '=') + 1;
-		} else if (strstr(token, "prompt=") != NULL) {
-			prompt = strchr(token, '=') + 1;
-			//convert prompt to url encode of the prompt
-			prompt_encoded = curl_easy_escape(NULL, prompt, 0);
-		} else if (strstr(token, "model=") != NULL) {
-			model = strchr(token, '=') + 1;
-		}
-		token = strtok(NULL, "&");
-	}
-
-	// Store the language and prompt in the channel, if language not available, NULL
-	if (language == NULL) {
-		// Handle the error
-		apt_log(RECOG_LOG_MARK,APT_PRIO_WARNING,"Failed to extract language");
-		language = "";
-	}
-	recog_channel->language = strdup(language);
-	apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Language: %s",recog_channel->language);
-	
-	if (prompt_encoded == NULL) {
-		// Handle the error
-		apt_log(RECOG_LOG_MARK,APT_PRIO_WARNING,"Failed to encode prompt");
-		prompt_encoded="";
-	}
-	recog_channel->prompt = strdup(prompt_encoded);
-	apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Prompt: %s",recog_channel->prompt);
-
-	if (model == NULL) {
-		// Handle the error
-		apt_log(RECOG_LOG_MARK,APT_PRIO_WARNING,"Failed to extract model");
-		model = "";
 	}
 
 	response->start_line.request_state = MRCP_REQUEST_STATE_INPROGRESS;
@@ -710,10 +728,14 @@ static apt_bool_t sippulse_recog_recognition_complete(sippulse_recog_channel_t *
 	if(cause == RECOGNIZER_COMPLETION_CAUSE_SUCCESS) {
 			/* load recognition result */
 			const char *result = recog_channel->http_response->response_body;
+			const int result_size = recog_channel->http_response->response_size;
+			
 			char* nlsmlResult = createNLSMLResponse(result);
-
+			
     		if (nlsmlResult != NULL) {
         		apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"NLSML Response created: %s", nlsmlResult);
+				//Send plain text instead
+				//apt_string_assign_n(&message->body,result,strlen(result),message->pool);
 				apt_string_assign_n(&message->body,nlsmlResult,strlen(nlsmlResult),message->pool);
 				free(nlsmlResult); // Remember to free the allocated memory
     		} else {
@@ -726,8 +748,10 @@ static apt_bool_t sippulse_recog_recognition_complete(sippulse_recog_channel_t *
 			mrcp_generic_header_t *generic_header = mrcp_generic_header_prepare(message);
 			if(generic_header) {
 				/* set content types */
-				apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Setting Content Type to x-nlsml");
-				apt_string_assign(&generic_header->content_type,"application/x-nlsml",message->pool);
+				//apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Setting Content Type to text/plain");
+				//apt_string_assign(&generic_header->content_type,"text/plain; charset=UTF-8",message->pool);
+				apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Setting Content Type to application/nlsml");
+				apt_string_assign(&generic_header->content_type,"application/nlsml",message->pool);
 				mrcp_generic_header_property_add(message,GENERIC_HEADER_CONTENT_TYPE);
 			}
 	}
