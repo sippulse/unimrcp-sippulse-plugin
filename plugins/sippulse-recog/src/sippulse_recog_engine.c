@@ -156,6 +156,7 @@ struct sippulse_recog_msg_t {
 
 static apt_bool_t sippulse_recog_msg_signal(sippulse_recog_msg_type_e type, mrcp_engine_channel_t *channel, mrcp_message_t *request);
 static apt_bool_t sippulse_recog_msg_process(apt_task_t *task, apt_task_msg_t *msg);
+static void cleanup_http_response(sippulse_recog_channel_t *recog_channel);
 
 /** Declare this macro to set plugin version */
 MRCP_PLUGIN_VERSION_DECLARE
@@ -169,6 +170,88 @@ MRCP_PLUGIN_LOG_SOURCE_IMPLEMENT(RECOG_PLUGIN,"RECOG-PLUGIN")
 
 /** Use custom log source mark */
 #define RECOG_LOG_MARK   APT_LOG_MARK_DECLARE(RECOG_PLUGIN)
+
+// Função para URL decode (para suportar %3B no lugar de ; no Asterisk)
+static char* url_decode(const char *str) {
+    if (!str) return NULL;
+    
+    size_t len = strlen(str);
+    char *decoded = (char*)malloc(len + 1);
+    if (!decoded) return NULL;
+    
+    char *p = decoded;
+    for (size_t i = 0; i < len; i++) {
+        if (str[i] == '%' && i + 2 < len) {
+            // Converter %XX para caractere
+            char hex[3] = {str[i+1], str[i+2], '\0'};
+            char *endptr;
+            long val = strtol(hex, &endptr, 16);
+            if (*endptr == '\0' && val >= 0 && val <= 255) {
+                *p++ = (char)val;
+                i += 2; // Pular os dois caracteres hex
+            } else {
+                *p++ = str[i]; // Manter % se não for hex válido
+            }
+        } else {
+            *p++ = str[i];
+        }
+    }
+    *p = '\0';
+    
+    return decoded;
+}
+
+// Função para fazer parsing manual dos vendor-specific parameters que vêm concatenados
+static void parse_concatenated_params(const char *param_string, sippulse_recog_channel_t *recog_channel) {
+    if (!param_string) return;
+    
+    apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Parsing concatenated params: '%s'", param_string);
+    
+    // Fazer uma cópia para trabalhar
+    char *working_copy = strdup(param_string);
+    if (!working_copy) return;
+    
+    // Dividir por ; ou %3B
+    char *token = strtok(working_copy, ";");
+    int token_count = 0;
+    
+    while (token != NULL) {
+        apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Processing token: '%s'", token);
+        
+        // Procurar por = para separar nome=valor
+        char *equals_pos = strchr(token, '=');
+        if (equals_pos) {
+            *equals_pos = '\0'; // Dividir a string
+            char *param_name = token;
+            char *param_value = equals_pos + 1;
+            
+            apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Found param: '%s' = '%s'", param_name, param_value);
+            
+            if (strcasecmp(param_name, "prompt") == 0) {
+                recog_channel->prompt = apr_pstrdup(recog_channel->channel->pool, param_value);
+                apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Set prompt: '%s'", recog_channel->prompt);
+            } else if (strcasecmp(param_name, "sttmodel") == 0) {
+                recog_channel->model = apr_palloc(recog_channel->channel->pool, sizeof(apt_str_t));
+                recog_channel->model->buf = apr_pstrdup(recog_channel->channel->pool, param_value);
+                recog_channel->model->length = strlen(param_value);
+                apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Set STT model: '%s'", recog_channel->model->buf);
+            }
+        } else {
+            // Token sem '=' - se for o primeiro token, assumir que é o prompt
+            if (token_count == 0) {
+                recog_channel->prompt = apr_pstrdup(recog_channel->channel->pool, token);
+                apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Set prompt from first token: '%s'", recog_channel->prompt);
+            } else {
+                apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Ignoring token without '=': '%s'", token);
+            }
+        }
+        
+        token = strtok(NULL, ";");
+        token_count++;
+    }
+    
+    free(working_copy);
+}
 
 /** Executado no momento da carga do plugin */
 MRCP_PLUGIN_DECLARE(mrcp_engine_t*) mrcp_plugin_create(apr_pool_t *pool)
@@ -215,6 +298,103 @@ const char* get_prompt_value(const apt_pair_arr_t *param_pairs, apr_pool_t *pool
 }
 
 
+// Função simples para URL encoding
+char* url_encode_simple(const char *str) {
+    if (!str) return NULL;
+    
+    size_t len = strlen(str);
+    // Pior caso: cada caractere vira %XX (3 caracteres)
+    char *encoded = (char*)malloc(len * 3 + 1);
+    if (!encoded) return NULL;
+    
+    char *p = encoded;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)str[i];
+        
+        // Caracteres que não precisam ser encodados
+        if ((c >= 'A' && c <= 'Z') || 
+            (c >= 'a' && c <= 'z') || 
+            (c >= '0' && c <= '9') ||
+            c == '-' || c == '_' || c == '.' || c == '~') {
+            *p++ = c;
+        } else if (c == ' ') {
+            // Espaço vira %20
+            *p++ = '%';
+            *p++ = '2';
+            *p++ = '0';
+        } else {
+            // Outros caracteres viram %XX
+            sprintf(p, "%%%02X", c);
+            p += 3;
+        }
+    }
+    *p = '\0';
+    
+    return encoded;
+}
+
+// Função para extrair o campo "text" do JSON
+char* extract_text_from_json(const char *json_response) {
+    if (!json_response) {
+        return NULL;
+    }
+    
+    // Procurar pelo campo "text" no JSON
+    const char *text_start = strstr(json_response, "\"text\":\"");
+    if (!text_start) {
+        apt_log(RECOG_LOG_MARK, APT_PRIO_WARNING, "Campo 'text' não encontrado no JSON");
+        return NULL;
+    }
+    
+    // Avançar para o início do valor do texto
+    text_start += strlen("\"text\":\"");
+    
+    // Encontrar o final do valor do texto (próxima aspas dupla não escapada)
+    const char *text_end = text_start;
+    while (*text_end && *text_end != '"') {
+        if (*text_end == '\\' && *(text_end + 1)) {
+            text_end += 2; // Pular caractere escapado
+        } else {
+            text_end++;
+        }
+    }
+    
+    if (*text_end != '"') {
+        apt_log(RECOG_LOG_MARK, APT_PRIO_WARNING, "Final do campo 'text' não encontrado no JSON");
+        return NULL;
+    }
+    
+    // Calcular o tamanho do texto
+    size_t text_length = text_end - text_start;
+    
+    // Verificar se o tamanho é razoável (evitar buffer overflow)
+    if (text_length > 10000) {  // Limite razoável para texto de resposta
+        apt_log(RECOG_LOG_MARK, APT_PRIO_WARNING, "Texto extraído muito grande (%zu bytes), limitando", text_length);
+        text_length = 10000;
+    }
+    
+    // Alocar memória para o texto extraído
+    char *extracted_text = (char*)malloc(text_length + 1);
+    if (!extracted_text) {
+        apt_log(RECOG_LOG_MARK, APT_PRIO_WARNING, "Falha na alocação de memória para texto extraído");
+        return NULL;
+    }
+    
+    // Copiar o texto
+    strncpy(extracted_text, text_start, text_length);
+    extracted_text[text_length] = '\0';
+    
+    // Remover quebras de linha e espaços extras no final
+    char *end = extracted_text + strlen(extracted_text) - 1;
+    while (end > extracted_text && (*end == '\n' || *end == '\r' || *end == ' ')) {
+        *end = '\0';
+        end--;
+    }
+    
+    apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Texto extraído do JSON: '%s'", extracted_text);
+    return extracted_text;
+}
+
 // Função para criar a resposta NLSML
 char* createNLSMLResponse(const char *result) {
     // Estimate the size needed for the NLSML string, adjusting as necessary
@@ -246,7 +426,7 @@ size_t my_curl_write_callback(void *contents, size_t size, size_t nmemb, void *u
   char *ptr = realloc(mem->memory, mem->size + realsize + 1);
   if(!ptr) {
     /* out of memory! */
-    printf("not enough memory (realloc returned NULL)\n");
+    apt_log(RECOG_LOG_MARK, APT_PRIO_WARNING, "Out of memory in curl callback (realloc returned NULL)");
     return 0;
   }
  
@@ -275,9 +455,6 @@ int sippulse_recognizer_accept_waveform(sippulse_recog_channel_t *recog_channel)
 	long frame_size=0;
 	char * frame_buffer = NULL;
 	struct MemoryStruct chunk;
-  	chunk.memory = malloc(1);  /* grown as needed by the realloc above */
-  	chunk.size = 0;    /* no data at this point */
-
 
 	 // Seek to the end of the file to determine the size
     fseek(recog_channel->audio_out, 0, SEEK_END);
@@ -311,21 +488,42 @@ int sippulse_recognizer_accept_waveform(sippulse_recog_channel_t *recog_channel)
 	if (curl) {
 		char url[8192];
 		
-		apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Language for whisper: %s", recog_channel->language->buf);
+		// Verificação segura dos campos language e model
+		const char *language_str = "en";  // Padrão
+		const char *model_str = "whisper-1";  // Padrão
 		
-
-		//Set defaults
-		//if(recog_channel->model->buf=="" || recog_channel->model->buf==NULL) {
-		//	recog_channel->model->buf="whisper-1";
-		//}
-
-		if(recog_channel->prompt=="" || recog_channel->prompt==NULL) {
-			snprintf(url, sizeof(url), "https://api.sippulse.ai/v1/asr/transcribe?language=%s&response_format=text&model=%s", recog_channel->language->buf, recog_channel->model->buf);
+		if(recog_channel->language && recog_channel->language->buf && recog_channel->language->length > 0) {
+			language_str = recog_channel->language->buf;
+		}
+		
+		if(recog_channel->model && recog_channel->model->buf && recog_channel->model->length > 0) {
+			model_str = recog_channel->model->buf;
+		}
+		
+		apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Language for whisper: %s", language_str);
+		apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Model for whisper: %s", model_str);
+		
+		// Construir URL com parâmetros - seguindo o formato correto da API
+		if(recog_channel->prompt && strlen(recog_channel->prompt) > 0) {
+			// URL encode do prompt
+			char *encoded_prompt = url_encode_simple(recog_channel->prompt);
+			if (encoded_prompt) {
+				apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Using prompt: '%s' (encoded: '%s')", recog_channel->prompt, encoded_prompt);
+				snprintf(url, sizeof(url), "https://api.sippulse.ai/asr/transcribe?model=%s&language=%s&prompt=%s&response_format=text", 
+					model_str, language_str, encoded_prompt);
+				free(encoded_prompt);
+			} else {
+				apt_log(RECOG_LOG_MARK,APT_PRIO_WARNING,"Failed to encode prompt, using without encoding");
+				snprintf(url, sizeof(url), "https://api.sippulse.ai/asr/transcribe?model=%s&language=%s&prompt=%s&response_format=text", 
+					model_str, language_str, recog_channel->prompt);
+			}
 		} else {
-			snprintf(url, sizeof(url), "https://api.sippulse.ai/v1/asr/transcribe?language=%s&response_format=text&model=%s&prompt=%s", recog_channel->language->buf, recog_channel->model->buf,recog_channel->prompt);
+			apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"No prompt specified");
+			snprintf(url, sizeof(url), "https://api.sippulse.ai/asr/transcribe?model=%s&language=%s&response_format=text", 
+				model_str, language_str);
 		}
 
-		apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"URL: %s", url);
+		apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Final URL: %s", url);
 		curl_easy_setopt(curl, CURLOPT_URL, url);
 	
 		// Prepare headers
@@ -335,8 +533,7 @@ int sippulse_recognizer_accept_waveform(sippulse_recog_channel_t *recog_channel)
 		headers = curl_slist_append(headers, auth_header);
 		curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
-		// The rest of the function setup remains the same until CURLOPT_HTTPPOST setting
-		// Here, use CURLFORM_BUFFERPTR instead of CURLFORM_FILE
+		// Adicionar APENAS o arquivo como form data
 		curl_formadd(&formpost, &lastptr,
              CURLFORM_COPYNAME, "file",
              CURLFORM_BUFFER, "speech1.pcm",
@@ -477,6 +674,23 @@ static mrcp_engine_channel_t* sippulse_recog_engine_channel_create(mrcp_engine_t
 	recog_channel->stop_response = NULL;
 	recog_channel->detector = mpf_activity_detector_create(pool);
 	recog_channel->audio_out = NULL;
+	
+	// Inicializar campos language e model com valores padrão
+	recog_channel->language = NULL;
+	recog_channel->model = NULL;
+	recog_channel->prompt = NULL;
+	recog_channel->http_response = NULL;
+	
+	// Configurar detector com valores mais sensíveis
+	if(recog_channel->detector) {
+		// Configurar timeouts padrão mais baixos para melhor responsividade
+		mpf_activity_detector_noinput_timeout_set(recog_channel->detector, 3000);  // 3 segundos
+		mpf_activity_detector_silence_timeout_set(recog_channel->detector, 1500);  // 1.5 segundos
+		
+		// Configurar threshold mais sensível para detectar silêncio
+		mpf_activity_detector_level_set(recog_channel->detector, 10);  // Threshold mais baixo
+		apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Activity detector configured with sensitive settings");
+	}
 
 	capabilities = mpf_sink_stream_capabilities_create(pool);
 	mpf_codec_capabilities_add(
@@ -553,40 +767,125 @@ static apt_bool_t sippulse_recog_channel_recognize(mrcp_engine_channel_t *channe
 	if(recog_header) {
 		if(mrcp_resource_header_property_check(request,RECOGNIZER_HEADER_START_INPUT_TIMERS) == TRUE) {
 			recog_channel->timers_started = recog_header->start_input_timers;
+			apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Start Input Timers from header: %s", recog_channel->timers_started ? "TRUE" : "FALSE");
+		}
+		
+		// Forçar timers para TRUE se estiver FALSE
+		if(!recog_channel->timers_started) {
+			recog_channel->timers_started = TRUE;
+			apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Forcing Start Input Timers to TRUE for proper detection");
 		}
 		if(mrcp_resource_header_property_check(request,RECOGNIZER_HEADER_NO_INPUT_TIMEOUT) == TRUE) {
 			mpf_activity_detector_noinput_timeout_set(recog_channel->detector,recog_header->no_input_timeout);
+			apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "No Input Timeout: %d ms", recog_header->no_input_timeout);
+		} else {
+			// Definir timeout padrão mais baixo (3 segundos)
+			mpf_activity_detector_noinput_timeout_set(recog_channel->detector, 3000);
+			apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Using default No Input Timeout: 3000 ms");
 		}
 		if(mrcp_resource_header_property_check(request,RECOGNIZER_HEADER_SPEECH_COMPLETE_TIMEOUT) == TRUE) {
 			mpf_activity_detector_silence_timeout_set(recog_channel->detector,recog_header->speech_complete_timeout);
+			apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Speech Complete Timeout: %d ms", recog_header->speech_complete_timeout);
+		} else {
+			// Definir timeout padrão mais baixo (1.5 segundos)
+			mpf_activity_detector_silence_timeout_set(recog_channel->detector, 1500);
+			apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Using default Speech Complete Timeout: 1500 ms");
 		}
 
 		//Get the other recog headers
 		if(mrcp_resource_header_property_check(request,RECOGNIZER_HEADER_SPEECH_LANGUAGE) == TRUE) {
 			recog_channel->language = &recog_header->speech_language;
+			apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Language do cabeçalho MRCP: %s", recog_channel->language->buf ? recog_channel->language->buf : "(null)");
+		}
+		
+		// Definir language padrão se não foi especificado
+		if(!recog_channel->language || !recog_channel->language->buf || recog_channel->language->length == 0 || 
+		   strlen(recog_channel->language->buf) == 0) {
+			apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Language inválido ou vazio, definindo padrão");
+			recog_channel->language = apr_palloc(recog_channel->channel->pool, sizeof(apt_str_t));
+			recog_channel->language->buf = apr_pstrdup(recog_channel->channel->pool, "en");
+			recog_channel->language->length = strlen("en");
+			apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Usando language padrão: en");
 		}
 
-		//Get the other recog headers
-		if(mrcp_resource_header_property_check(request,RECOGNIZER_HEADER_RECOGNITION_MODE) == TRUE) {
-			recog_channel->model = &recog_header->recognition_mode;
-		}
+		// Inicializar modelo como NULL - será definido por último
+		recog_channel->model = NULL;
 
 		//Get the other recog headers
 		if(mrcp_generic_header_property_check(request,GENERIC_HEADER_VENDOR_SPECIFIC_PARAMS) == TRUE) {
 			mrcp_generic_header_t *generic_header = mrcp_generic_header_get(request);
-			recog_channel->prompt=NULL;
+			recog_channel->prompt = NULL;
 			pair_array = generic_header->vendor_specific_params;
+			
+			apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Processing vendor-specific parameters, count: %d", pair_array->nelts);
+			
 			for (int i = 0; i < pair_array->nelts; i++) {
         		apt_pair_t *pair = &APR_ARRAY_IDX(pair_array, i, apt_pair_t);
-        		if (pair && pair->name.buf && strcasecmp(pair->name.buf, "com.sippulse.prompt") == 0) {
-            		recog_channel->prompt=pair->value.buf;
+        		if (pair && pair->name.buf) {
+					apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Vendor param [%d]: name='%s', value='%s'", 
+						i, pair->name.buf, pair->value.buf ? pair->value.buf : "(null)");
+					
+					// Aplicar URL decode no valor para suportar %3B no Asterisk
+					char *decoded_value = url_decode(pair->value.buf);
+					const char *final_value = decoded_value ? decoded_value : pair->value.buf;
+					
+					apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Decoded value: '%s'", final_value);
+					
+					// Se o valor contém ; significa que tem múltiplos parâmetros concatenados
+					if (strstr(final_value, ";") != NULL) {
+						apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Found concatenated parameters, parsing...");
+						parse_concatenated_params(final_value, recog_channel);
+					} else {
+						// Parâmetro individual
+						if (strcasecmp(pair->name.buf, "prompt") == 0 || 
+							strcasecmp(pair->name.buf, "com.sippulse.prompt") == 0) {
+							recog_channel->prompt = apr_pstrdup(recog_channel->channel->pool, final_value);
+							apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Single prompt found: '%s'", recog_channel->prompt);
+						} else if (strcasecmp(pair->name.buf, "sttmodel") == 0) {
+							recog_channel->model = apr_palloc(recog_channel->channel->pool, sizeof(apt_str_t));
+							recog_channel->model->buf = apr_pstrdup(recog_channel->channel->pool, final_value);
+							recog_channel->model->length = strlen(final_value);
+							apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Single STT model found: '%s'", recog_channel->model->buf);
+						}
+					}
+					
+					// Liberar memória alocada pelo url_decode
+					if (decoded_value) {
+						free(decoded_value);
+					}
 				}
 			}
-			//recog_channel->prompt=prompt_value;
-			//const char *prompt_value=get_prompt_value(pair_array,pool);
-			//apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Prompt for whisper: %s", recog_channel->prompt->buf);
+			
+			if (recog_channel->prompt == NULL) {
+				apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Nenhum prompt encontrado nos vendor-specific parameters");
+			}
+		} else {
+			apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Nenhum vendor-specific parameter encontrado");
 		}
 	}
+
+	// DEFINIR MODELO POR ÚLTIMO - após processar todos os vendor-specific parameters
+	// Primeiro, tentar obter do cabeçalho MRCP se ainda não foi definido
+	if(!recog_channel->model && mrcp_resource_header_property_check(request,RECOGNIZER_HEADER_RECOGNITION_MODE) == TRUE) {
+		recog_channel->model = &recog_header->recognition_mode;
+		apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Modelo do cabeçalho MRCP: %s", recog_channel->model->buf ? recog_channel->model->buf : "(null)");
+	}
+	
+	// Definir modelo padrão se não foi especificado em nenhum lugar
+	if(!recog_channel->model || !recog_channel->model->buf || recog_channel->model->length == 0 || 
+	   strlen(recog_channel->model->buf) == 0) {
+		apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Modelo inválido ou vazio, definindo padrão");
+		recog_channel->model = apr_palloc(recog_channel->channel->pool, sizeof(apt_str_t));
+		recog_channel->model->buf = apr_pstrdup(recog_channel->channel->pool, "whisper-1");
+		recog_channel->model->length = strlen("whisper-1");
+		apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Usando modelo padrão: whisper-1");
+	}
+	
+	// Log final dos parâmetros que serão usados
+	apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "PARÂMETROS FINAIS - Language: %s, Model: %s, Prompt: %s", 
+		recog_channel->language ? recog_channel->language->buf : "(null)",
+		recog_channel->model ? recog_channel->model->buf : "(null)",
+		recog_channel->prompt ? recog_channel->prompt : "(null)");
 
 	if(!recog_channel->audio_out) {
 		const apt_dir_layout_t *dir_layout = channel->engine->dir_layout;
@@ -605,6 +904,9 @@ static apt_bool_t sippulse_recog_channel_recognize(mrcp_engine_channel_t *channe
 		}
 	}
 
+	// Log final do estado dos timers
+	apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Final Timer State: %s", recog_channel->timers_started ? "TRUE" : "FALSE");
+	
 	response->start_line.request_state = MRCP_REQUEST_STATE_INPROGRESS;
 	/* send asynchronous response */
 	mrcp_engine_channel_message_send(channel,response);
@@ -727,19 +1029,27 @@ static apt_bool_t sippulse_recog_recognition_complete(sippulse_recog_channel_t *
 
 	if(cause == RECOGNIZER_COMPLETION_CAUSE_SUCCESS) {
 			/* load recognition result */
-			const char *result = recog_channel->http_response->response_body;
+			const char *json_result = recog_channel->http_response->response_body;
 			const int result_size = recog_channel->http_response->response_size;
 			
-			char* nlsmlResult = createNLSMLResponse(result);
+			apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"JSON Response from API: %s", json_result);
+			
+			// Extrair apenas o campo "text" do JSON
+			char* extracted_text = extract_text_from_json(json_result);
+			if (!extracted_text) {
+				apt_log(RECOG_LOG_MARK,APT_PRIO_WARNING,"Failed to extract text from JSON response");
+				return FALSE;
+			}
+			
+			char* nlsmlResult = createNLSMLResponse(extracted_text);
 			
     		if (nlsmlResult != NULL) {
         		apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"NLSML Response created: %s", nlsmlResult);
-				//Send plain text instead
-				//apt_string_assign_n(&message->body,result,strlen(result),message->pool);
 				apt_string_assign_n(&message->body,nlsmlResult,strlen(nlsmlResult),message->pool);
 				free(nlsmlResult); // Remember to free the allocated memory
+				free(extracted_text); // Free the extracted text
     		} else {
-				free(nlsmlResult); // Remember to free the allocated memory
+				free(extracted_text); // Free the extracted text
 				apt_log(RECOG_LOG_MARK,APT_PRIO_WARNING,"Failed to create NLSML Response");
 				return FALSE;
 			}
@@ -760,6 +1070,9 @@ static apt_bool_t sippulse_recog_recognition_complete(sippulse_recog_channel_t *
 					MRCP_MESSAGE_SIDRES(recog_channel->recog_request));
 
 	recog_channel->recog_request = NULL;
+	
+	// Limpar http_response para evitar memory leak
+	cleanup_http_response(recog_channel);
 
 	return mrcp_engine_channel_message_send(recog_channel->channel,message);
 }
@@ -788,21 +1101,44 @@ static apt_bool_t sippulse_recog_stream_write(mpf_audio_stream_t *stream, const 
 				apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Detected Voice Inactivity " APT_SIDRES_FMT,
 					MRCP_MESSAGE_SIDRES(recog_channel->recog_request));
 				
-				if(!sippulse_recognizer_accept_waveform(recog_channel)) {
-					apt_log(RECOG_LOG_MARK,APT_PRIO_WARNING,"Failed to Accept Waveform " APT_SIDRES_FMT,
-					MRCP_MESSAGE_SIDRES(recog_channel->recog_request));
+				// Verificar se há áudio capturado
+				if(recog_channel->audio_out) {
+					long file_size = ftell(recog_channel->audio_out);
+					apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Audio captured: %ld bytes", file_size);
+					
+					if(file_size > 0) {
+						if(!sippulse_recognizer_accept_waveform(recog_channel)) {
+							apt_log(RECOG_LOG_MARK,APT_PRIO_WARNING,"Failed to Accept Waveform " APT_SIDRES_FMT,
+							MRCP_MESSAGE_SIDRES(recog_channel->recog_request));
+							sippulse_recog_recognition_complete(recog_channel, RECOGNIZER_COMPLETION_CAUSE_ERROR);
+						} else {
+							apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Waveform accepted, completing recognition");
+							sippulse_recog_recognition_complete(recog_channel, RECOGNIZER_COMPLETION_CAUSE_SUCCESS);
+						}
+					} else {
+						apt_log(RECOG_LOG_MARK,APT_PRIO_WARNING,"No audio captured, completing with no-input");
+						sippulse_recog_recognition_complete(recog_channel, RECOGNIZER_COMPLETION_CAUSE_NO_INPUT_TIMEOUT);
+					}
 				} else {
-					sippulse_recog_recognition_complete(recog_channel, RECOGNIZER_COMPLETION_CAUSE_SUCCESS);
+					apt_log(RECOG_LOG_MARK,APT_PRIO_WARNING,"Audio file not open");
+					sippulse_recog_recognition_complete(recog_channel, RECOGNIZER_COMPLETION_CAUSE_ERROR);
 				}
 				break;
 			case MPF_DETECTOR_EVENT_NOINPUT:
 				apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Detected Noinput " APT_SIDRES_FMT,
 					MRCP_MESSAGE_SIDRES(recog_channel->recog_request));
 				if(recog_channel->timers_started == TRUE) {
+					apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Timers started, completing with no-input timeout");
 					sippulse_recog_recognition_complete(recog_channel,RECOGNIZER_COMPLETION_CAUSE_NO_INPUT_TIMEOUT);
+				} else {
+					apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Timers not started, ignoring no-input event");
 				}
 				break;
 			default:
+				// Log eventos desconhecidos para debug
+				if(det_event != MPF_DETECTOR_EVENT_NONE) {
+					apt_log(RECOG_LOG_MARK,APT_PRIO_DEBUG,"Unknown detector event: %d", det_event);
+				}
 				break;
 		}
 
@@ -870,6 +1206,9 @@ static apt_bool_t sippulse_recog_msg_process(apt_task_t *task, apt_task_msg_t *m
 				recog_channel->audio_out = NULL;
 			}
 			
+			// Limpar http_response para evitar memory leak
+			cleanup_http_response(recog_channel);
+			
 			mrcp_engine_channel_close_respond(sippulse_msg->channel);
 
 			break;
@@ -881,4 +1220,17 @@ static apt_bool_t sippulse_recog_msg_process(apt_task_t *task, apt_task_msg_t *m
 			break;
 	}
 	return TRUE;
+}
+
+// Função para limpar http_response e evitar memory leaks
+static void cleanup_http_response(sippulse_recog_channel_t *recog_channel) {
+    if (recog_channel->http_response) {
+        if (recog_channel->http_response->response_body) {
+            free(recog_channel->http_response->response_body);
+            recog_channel->http_response->response_body = NULL;
+        }
+        free(recog_channel->http_response);
+        recog_channel->http_response = NULL;
+        apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "HTTP response cleaned up");
+    }
 }

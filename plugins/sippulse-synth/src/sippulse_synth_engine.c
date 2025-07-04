@@ -145,6 +145,36 @@ MRCP_PLUGIN_LOG_SOURCE_IMPLEMENT(SYNTH_PLUGIN,"SYNTH-PLUGIN")
 /** Use custom log source mark */
 #define SYNTH_LOG_MARK   APT_LOG_MARK_DECLARE(SYNTH_PLUGIN)
 
+// Função para URL decode (para suportar %3B no lugar de ; no Asterisk)
+static char* url_decode(const char *str) {
+    if (!str) return NULL;
+    
+    size_t len = strlen(str);
+    char *decoded = (char*)malloc(len + 1);
+    if (!decoded) return NULL;
+    
+    char *p = decoded;
+    for (size_t i = 0; i < len; i++) {
+        if (str[i] == '%' && i + 2 < len) {
+            // Converter %XX para caractere
+            char hex[3] = {str[i+1], str[i+2], '\0'};
+            char *endptr;
+            long val = strtol(hex, &endptr, 16);
+            if (*endptr == '\0' && val >= 0 && val <= 255) {
+                *p++ = (char)val;
+                i += 2; // Pular os dois caracteres hex
+            } else {
+                *p++ = str[i]; // Manter % se não for hex válido
+            }
+        } else {
+            *p++ = str[i];
+        }
+    }
+    *p = '\0';
+    
+    return decoded;
+}
+
 /** GET the API from the enviroment variable SIPPULSE_API_KEY */
 const char* get_api_key() {
     return getenv("SIPPULSE_API_KEY");
@@ -243,7 +273,7 @@ void *perform_request(const char *voice, const char *text, const char* model, si
 
     curl = curl_easy_init();
     if(curl) {
-        curl_easy_setopt(curl, CURLOPT_URL, "https://api.sippulse.ai/v1/tts/generate");
+        curl_easy_setopt(curl, CURLOPT_URL, "https://api.dev.sippulse.ai/v1/tts/generate");
         curl_easy_setopt(curl, CURLOPT_POST, 1L);
         
         // Setup HTTP headers
@@ -270,7 +300,7 @@ void *perform_request(const char *voice, const char *text, const char* model, si
 		}
 
         // JSON data
-        const char *json_data_template = "{\"text\": \"%s\", \"voice\": \"%s\", \"output_format\": 16, \"model\": \"%s\"}";
+        const char *json_data_template = "{\"input\": \"%s\", \"voice\": \"%s\", \"response_format\": \"pcm\", \"model\": \"%s\", \"azureOptions\": {\"output_format\": 16}}";
 		char json_data_final[8192];
 		snprintf(json_data_final, sizeof(json_data_final), json_data_template, text, voice, model);
 		
@@ -292,6 +322,7 @@ void *perform_request(const char *voice, const char *text, const char* model, si
         } else {
             // Here, you would handle the response, e.g., by passing it to another part of your plugin
             printf("Response from server: %s\n", response.data);
+            apt_log(SYNTH_LOG_MARK, APT_PRIO_INFO, "JSON response from API: %s", response.data);
         }
 
 		// Extract the stream URL to a char variable nopcm_url
@@ -391,6 +422,10 @@ static mrcp_engine_channel_t* sippulse_synth_engine_channel_create(mrcp_engine_t
 	synth_channel->paused = FALSE;
 	synth_channel->audio_file = NULL;
 	
+	// Inicializar campos para evitar segfaults
+	synth_channel->model = NULL;
+	synth_channel->file_url = NULL;
+	
 	capabilities = mpf_source_stream_capabilities_create(pool);
 	mpf_codec_capabilities_add(
 			&capabilities->codecs,
@@ -460,8 +495,42 @@ static apt_bool_t sippulse_synth_channel_speak(mrcp_engine_channel_t *channel, m
 	mrcp_synth_header_t *req_synth_header = mrcp_resource_header_get(request);
 	const char *voice = req_synth_header->voice_param.name.buf;
 
-	// Extract model from the request in the Voice-Variant format
-	//variant is an apr_size_t, so we can't use the buf field
+	// Initialize defaults
+	model = "azure-tts";  // Default TTS model
+	
+	// Process vendor-specific parameters for TTS
+	if(mrcp_generic_header_property_check(request,GENERIC_HEADER_VENDOR_SPECIFIC_PARAMS) == TRUE) {
+		mrcp_generic_header_t *generic_header = mrcp_generic_header_get(request);
+		if(generic_header && generic_header->vendor_specific_params) {
+			apt_pair_arr_t *pair_array = generic_header->vendor_specific_params;
+			apt_log(SYNTH_LOG_MARK,APT_PRIO_INFO,"Processing %d vendor-specific parameters", pair_array->nelts);
+			
+			for (int i = 0; i < pair_array->nelts; i++) {
+				apt_pair_t *pair = &APR_ARRAY_IDX(pair_array, i, apt_pair_t);
+				if (pair && pair->name.buf && pair->value.buf) {
+					// Aplicar URL decode no valor para suportar %3B no Asterisk
+					char *decoded_value = url_decode(pair->value.buf);
+					const char *final_value = decoded_value ? decoded_value : pair->value.buf;
+					
+					apt_log(SYNTH_LOG_MARK,APT_PRIO_INFO,"Vendor parameter: %s = %s (decoded: %s)", 
+						pair->name.buf, pair->value.buf, final_value);
+					
+					if (strcasecmp(pair->name.buf, "ttsmodel") == 0) {
+						// Usar APR pool para alocar string decodificada
+						model = apr_pstrdup(channel->pool, final_value);
+						apt_log(SYNTH_LOG_MARK,APT_PRIO_INFO,"Using TTS model from vendor parameter: %s", model);
+					}
+					
+					// Liberar memória alocada pelo url_decode
+					if (decoded_value) {
+						free(decoded_value);
+					}
+				}
+			}
+		}
+	}
+	
+	// Use Voice-Variant format to determine TTS model
 	variant = req_synth_header->voice_param.variant;
 	if (variant == 0) {
 		model = "azure-tts";
@@ -472,9 +541,8 @@ static apt_bool_t sippulse_synth_channel_speak(mrcp_engine_channel_t *channel, m
 	} else if (variant == 3) {
 		model = "aws-tts";
 	} else {
-		apt_log(SYNTH_LOG_MARK,APT_PRIO_WARNING,"Invalid Variant " APT_SIDRES_FMT, MRCP_MESSAGE_SIDRES(request));
-		response->start_line.status_code = MRCP_STATUS_CODE_METHOD_FAILED;
-		return FALSE;
+		apt_log(SYNTH_LOG_MARK,APT_PRIO_WARNING,"Invalid Variant %d, using default model azure-tts", variant);
+		model = "azure-tts";
 	}
 	
 	//get the text from the MRCP v2 synth request
@@ -482,6 +550,21 @@ static apt_bool_t sippulse_synth_channel_speak(mrcp_engine_channel_t *channel, m
 
 	apt_log(SYNTH_LOG_MARK,APT_PRIO_INFO,"SPEAK Request Received " APT_SIDRES_FMT,
 		MRCP_MESSAGE_SIDRES(request));
+	apt_log(SYNTH_LOG_MARK,APT_PRIO_INFO,"TTS Text: '%s'", text ? text : "(null)");
+	apt_log(SYNTH_LOG_MARK,APT_PRIO_INFO,"TTS Model: '%s'", model ? model : "(null)");
+	
+	// Salva o texto sintetizado em arquivo compartilhado para o ASR usar como prompt
+	// O ASR pode usar o texto TTS como contexto para melhorar o reconhecimento
+	if (text && strlen(text) > 0) {
+		FILE *prompt_file = fopen("/tmp/sippulse_tts_prompt.txt", "w");
+		if (prompt_file) {
+			fprintf(prompt_file, "%s", text);
+			fclose(prompt_file);
+			apt_log(SYNTH_LOG_MARK, APT_PRIO_INFO, "Texto TTS salvo como contexto para ASR: '%s'", text);
+		} else {
+			apt_log(SYNTH_LOG_MARK, APT_PRIO_WARNING, "Falha ao salvar contexto TTS em arquivo");
+		}
+	}
 	
 	// Check if the response is valid
 	if(response->start_line.status_code != MRCP_STATUS_CODE_SUCCESS) {
