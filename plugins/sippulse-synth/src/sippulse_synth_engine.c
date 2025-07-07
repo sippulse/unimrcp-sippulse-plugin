@@ -273,7 +273,7 @@ void *perform_request(const char *voice, const char *text, const char* model, si
 
     curl = curl_easy_init();
     if(curl) {
-        curl_easy_setopt(curl, CURLOPT_URL, "https://api.dev.sippulse.ai/v1/tts/generate");
+        curl_easy_setopt(curl, CURLOPT_URL, "https://api.sippulse.ai/v1/tts/generate");
         curl_easy_setopt(curl, CURLOPT_POST, 1L);
         
         // Setup HTTP headers
